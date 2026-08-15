@@ -19,3 +19,7 @@ Then enable: Settings → Actions → General → Allow GitHub Actions to create
 2. Bot diffs your branch vs main
 3. Azure OpenAI writes the PR description
 4. Bot opens the PR automatically
+
+## Workflow files
+- `.github/workflows/auto-pr.yml` — auto PR creator
+- `.github/workflows/pr-review.yml` — AI code reviewer
