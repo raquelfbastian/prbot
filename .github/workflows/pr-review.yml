@@ -1,0 +1,138 @@
+name: 🔍 AI PR Review
+
+# Runs on every new PR and every subsequent push to an open PR.
+# Posts an Azure OpenAI code review as a PR comment.
+# On re-runs (synchronize), the previous bot comment is updated — no duplicates.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: Azure OpenAI code review
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect diff
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=100
+          git diff origin/${{ github.base_ref }}...HEAD \
+            -- '*.ts' '*.tsx' '*.js' '*.jsx' '*.css' '*.sql' \
+            | head -300 > /tmp/review_diff.txt
+          git diff origin/${{ github.base_ref }}...HEAD --stat | tail -5 > /tmp/review_stat.txt
+          git log origin/${{ github.base_ref }}..HEAD --oneline | head -10 > /tmp/review_commits.txt
+
+      # Write reviewer script to a file so prompt text stays out of YAML
+      - name: Write review script
+        run: |
+          cat > /tmp/run_review.py << 'SCRIPT_END'
+          import json, urllib.request, os
+
+          diff    = open('/tmp/review_diff.txt').read().strip()
+          stat    = open('/tmp/review_stat.txt').read().strip()
+          commits = open('/tmp/review_commits.txt').read().strip()
+
+          pr_title  = os.environ.get('PR_TITLE', '')
+          pr_author = os.environ.get('PR_AUTHOR', '')
+          base      = os.environ.get('BASE_BRANCH', 'main')
+          head      = os.environ.get('HEAD_BRANCH', '')
+          endpoint  = os.environ['AZURE_OPENAI_ENDPOINT'].rstrip('/')
+          api_key   = os.environ['AZURE_OPENAI_API_KEY']
+          deploy    = os.environ.get('AZURE_OPENAI_DEPLOYMENT') or 'gpt-4.1-mini'
+          url       = f"{endpoint}/openai/v1/chat/completions"
+
+          if not diff:
+            review = "## AI Review\nNo source file changes to review."
+          else:
+            system_msg = (
+              "You are a senior engineer doing a concise code review. "
+              "Flag only real issues. Never pad. Use markdown."
+            )
+            user_msg = "\n".join([
+              f"PR: {pr_title}",
+              f"Author: {pr_author} | {head} -> {base}",
+              "",
+              "Stack: React + Express, Azure SQL (mssql/T-SQL), Azure OpenAI (GPT-4.1-mini + FLUX.2-pro), MS Entra ID SSO.",
+              "",
+              "Commits:", commits,
+              "",
+              "Files changed:", stat,
+              "",
+              "Diff (up to 300 lines):",
+              diff,
+              "",
+              "Write the review in this exact format:",
+              "## AI Review",
+              "**Summary:** one sentence.",
+              "**Issues (blocking):** bugs, security holes, data loss. Write None if clean.",
+              "**Suggestions (non-blocking):** naming, edge cases, improvements. Write None if clean.",
+              "**Looks good:** what is done well.",
+              f"_Reviewed by Azure OpenAI ({deploy})_",
+            ])
+
+            payload = {
+              "model": deploy, "max_tokens": 1536,
+              "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+              ]
+            }
+            req = urllib.request.Request(url,
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json",
+                       "Authorization": f"Bearer {api_key}", "api-key": api_key})
+            with urllib.request.urlopen(req, timeout=60) as r:
+              review = json.loads(r.read())["choices"][0]["message"]["content"]
+
+          open('/tmp/review_body.txt', 'w').write(review)
+          print("Review generated")
+          SCRIPT_END
+
+      - name: Run AI review
+        env:
+          AZURE_OPENAI_ENDPOINT:   ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY:    ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          PR_TITLE:   ${{ github.event.pull_request.title }}
+          PR_AUTHOR:  ${{ github.event.pull_request.user.login }}
+          BASE_BRANCH: ${{ github.base_ref }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: python3 /tmp/run_review.py
+
+      # Update existing bot comment instead of posting a new one each push
+      - name: Find existing bot comment
+        id: find-comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COMMENT_ID=$(gh pr view ${{ github.event.pull_request.number }} \
+            --json comments \
+            --jq '[.comments[] | select(.author.login == "github-actions[bot]") | select(.body | startswith("## AI Review")) | .databaseId] | last // ""')
+          echo "comment_id=$COMMENT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Update existing comment
+        if: steps.find-comment.outputs.comment_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method PATCH \
+            /repos/${{ github.repository }}/issues/comments/${{ steps.find-comment.outputs.comment_id }} \
+            --field body="$(cat /tmp/review_body.txt)"
+
+      - name: Post new comment
+        if: steps.find-comment.outputs.comment_id == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body-file /tmp/review_body.txt

@@ -1,0 +1,120 @@
+name: 🤖 Auto-create PR
+
+# Triggers on any push to a feature/fix/chore branch.
+# Opens a PR against main if one doesn't already exist,
+# using Azure OpenAI (gpt-4.1-mini) to generate the description.
+
+on:
+  push:
+    branches:
+      - 'feat/**'
+      - 'fix/**'
+      - 'chore/**'
+      - 'refactor/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  create-pr:
+    name: Open PR with AI description
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if PR already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh pr list \
+            --head "${{ github.ref_name }}" \
+            --base main \
+            --json number \
+            --jq 'length')
+          echo "exists=$EXISTING" >> "$GITHUB_OUTPUT"
+
+      - name: Collect diff + commits
+        if: steps.check.outputs.exists == '0'
+        id: context
+        run: |
+          git fetch origin main --depth=100
+          git log origin/main..HEAD --oneline | head -15 > /tmp/commits.txt
+          git diff origin/main...HEAD --stat | tail -5  > /tmp/stat.txt
+          git diff origin/main...HEAD \
+            -- '*.ts' '*.tsx' '*.js' '*.jsx' '*.css' '*.sql' '*.json' \
+            | head -200 > /tmp/diff.txt
+
+          BRANCH="${{ github.ref_name }}"
+          SLUG="${BRANCH#feat/}"; SLUG="${SLUG#fix/}"; SLUG="${SLUG#chore/}"; SLUG="${SLUG#refactor/}"
+          TITLE=$(echo "$SLUG" | tr '-' ' ' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2); print}')
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+
+      # Write the Python script to a temp file so the prompt text
+      # lives in a shell heredoc and never confuses the YAML parser.
+      - name: Write AI script
+        if: steps.check.outputs.exists == '0'
+        run: |
+          cat > /tmp/gen_pr.py << 'SCRIPT_END'
+          import json, urllib.request, os
+
+          commits  = open('/tmp/commits.txt').read().strip()
+          stat     = open('/tmp/stat.txt').read().strip()
+          diff     = open('/tmp/diff.txt').read().strip()
+          branch   = os.environ.get('BRANCH', '')
+          endpoint = os.environ['AZURE_OPENAI_ENDPOINT'].rstrip('/')
+          api_key  = os.environ['AZURE_OPENAI_API_KEY']
+          deploy   = os.environ.get('AZURE_OPENAI_DEPLOYMENT') or 'gpt-4.1-mini'
+          url      = f"{endpoint}/openai/v1/chat/completions"
+
+          user_msg = "\n".join([
+            f"Branch: {branch}", "",
+            "Commits:", commits, "",
+            "Files changed:", stat, "",
+            "Diff excerpt:", diff, "",
+            "Write a GitHub PR description with these sections:",
+            "Summary (1-2 sentences), Changes (bullet list), Notes (env vars / migration steps if any).",
+            f"End with: Generated with Azure OpenAI ({deploy})",
+          ])
+
+          payload = {
+            "model": deploy, "max_tokens": 1024,
+            "messages": [
+              {"role": "system", "content": "You write concise GitHub PR descriptions. Be technical. Use markdown."},
+              {"role": "user",   "content": user_msg},
+            ]
+          }
+          req = urllib.request.Request(url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {api_key}", "api-key": api_key})
+          with urllib.request.urlopen(req, timeout=60) as r:
+            body = json.loads(r.read())["choices"][0]["message"]["content"]
+          open('/tmp/pr_body.txt', 'w').write(body)
+          print("PR description generated")
+          SCRIPT_END
+
+      - name: Generate PR description
+        if: steps.check.outputs.exists == '0'
+        env:
+          AZURE_OPENAI_ENDPOINT:   ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY:    ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          BRANCH: ${{ github.ref_name }}
+        run: python3 /tmp/gen_pr.py
+
+      - name: Create PR
+        if: steps.check.outputs.exists == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "${{ steps.context.outputs.title }}" \
+            --body-file /tmp/pr_body.txt \
+            --base main \
+            --head "${{ github.ref_name }}"
