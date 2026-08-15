@@ -14,3 +14,8 @@ Add these secrets (Settings → Secrets → Actions):
 - `AZURE_OPENAI_DEPLOYMENT`
 
 Then enable: Settings → Actions → General → Allow GitHub Actions to create and approve pull requests ✓
+## How it works
+1. Push to feat/* branch
+2. Bot diffs your branch vs main
+3. Azure OpenAI writes the PR description
+4. Bot opens the PR automatically
